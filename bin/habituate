@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# habituate — create and manage habitats: groups of related repos that share one
+# authored CLAUDE.md of institutional knowledge. Thin and deterministic: it only
+# scaffolds (dirs, symlinks, git); the RULES stay hand-authored.
+set -euo pipefail
+
+# This script lives at <habituate-root>/bin/habituate.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+HABITATS="$ROOT/habitats"
+OUTINS="$(dirname "$ROOT")"   # where member repos usually live (parent of the habituate repo)
+TEMPLATE_CLAUDE="$ROOT/templates/CLAUDE.md.tmpl"
+# tooling artifacts that must NOT count as in-flight work in `activity`:
+ACTIVITY_IGNORE='\.beads/export-state\.json'
+# a member repo with no commit in this many days is flagged 'dormant' by `create --from` (suggestion only):
+STALE_DAYS=180
+
+die()  { printf 'habituate: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+habituate — manage habitats (groups of related repos sharing an authored CLAUDE.md)
+
+Usage:
+  habituate create <name> <member>...   Symlink members (absolute), stub CLAUDE.md, git init + commit
+  habituate create <name> --from <dir>  Suggest <dir>'s git-repo children as members (flag nested/dormant); prints only
+  habituate doctor [<name>]             Verify habitat(s): parent symlink, member symlinks, git repo
+  habituate activity [<name>]           Flag members with in-flight work (dirty tree / git lock / uncommitted tasks-seeds)
+  habituate ready [<name>]              Aggregate 'bd ready' + 'seeds ready' across a habitat's members
+  habituate members [<name>]            Print each member's bead/seed prefix (deterministic; to author into CLAUDE.md)
+  habituate list                        List habitats
+  habituate path <name>                 Print a habitat's absolute directory
+  habituate hop <name>                  Print a habitat's dir (the shell wrapper adds cd + tmux)
+
+<member> is a repo path: absolute, relative to CWD, or relative to the outins root
+(e.g. ohdsi_supplemental_vocabs or one_offs/icd10cm). Members are NOT modified — they stay
+habitat-agnostic; a habitat loads by being your cwd, not via anything in the member repos.
+EOF
+}
+
+# Resolve a member argument to an absolute, real directory.
+resolve_member() {
+  local m="$1" r
+  if r="$(realpath -e "$m" 2>/dev/null)"; then printf '%s\n' "$r"; return 0; fi
+  if r="$(realpath -e "$OUTINS/$m" 2>/dev/null)"; then printf '%s\n' "$r"; return 0; fi
+  return 1
+}
+
+# Ensure habitats/CLAUDE.md symlinks the general HABITAT.md, so it auto-loads for every habitat.
+ensure_parent_symlink() {
+  mkdir -p "$HABITATS"
+  local link="$HABITATS/CLAUDE.md"
+  if [ ! -e "$link" ]; then
+    ln -sf ../HABITAT.md "$link"
+    info "  ensured habitats/CLAUDE.md -> ../HABITAT.md"
+  fi
+}
+
+member_prefixes() {  # echo "beadprefix|seedprefix" for a member's real directory
+  local m="$1" bp sp id
+  if [ -d "$m/.beads" ]; then
+    id="$(grep -o '"id":"[^"]*"' "$m/.beads/issues.jsonl" 2>/dev/null | head -1 | sed 's/.*"id":"//; s/"//' || true)"
+    if [ -n "$id" ]; then bp="${id%-*}"; else bp="(none yet)"; fi
+  else bp="-"; fi
+  if [ -d "$m/.seeds" ]; then
+    sp="$(cd "$m" && seeds prefix 2>/dev/null || true)"; [ -n "$sp" ] || sp="(none)"
+  else sp="-"; fi
+  printf '%s|%s\n' "$bp" "$sp"
+}
+
+write_skeleton() {
+  local hab="$1" name="$2"; shift 2
+  local members=("$@") m bullets="" content pfx bp sp
+  [ -f "$TEMPLATE_CLAUDE" ] || die "missing habitat CLAUDE.md template: $TEMPLATE_CLAUDE"
+  for m in "${members[@]}"; do
+    pfx="$(member_prefixes "$m")"; bp="${pfx%%|*}"; sp="${pfx##*|}"
+    bullets+="- \`$(basename "$m")\` (beads:$bp, seeds:$sp) — TODO: role"$'\n'
+  done
+  bullets="${bullets%$'\n'}"
+  content="$(cat "$TEMPLATE_CLAUDE")"
+  content="${content//'{{NAME}}'/$name}"
+  content="${content//'{{MEMBERS}}'/$bullets}"
+  printf '%s\n' "$content" > "$hab/CLAUDE.md"
+  # README is tiny — kept inline.
+  # shellcheck disable=SC2016
+  {
+    printf '# %s — a habitat\n\n' "$name"
+    printf 'A group of related repos sharing the authored rules in [`CLAUDE.md`](CLAUDE.md). Part of the **habituate** project.\n\n'
+    printf 'Members are symlinked here; work across them from this directory (see `HABITAT.md`).\n'
+  } > "$hab/README.md"
+}
+
+# Suggest candidate members under a parent dir (for `create --from`): list the git repos
+# beneath it (direct children, plus one level into non-repo dirs like gems/), flag each
+# nested (not a direct child) and dormant (no commit in STALE_DAYS days, or a nested gem
+# referenced in no member Gemfile), and print a ready-to-edit `create` line. Prints only —
+# members stay hand-confirmed; nothing is scaffolded.
+suggest_members() {
+  local name="$1" parent="$2" real p sub repo base nested dormant stale referenced ts last_rel mark secs age
+  real="$(resolve_member "$parent")" || die "parent dir not found: $parent"
+  [ -d "$real" ] || die "parent is not a directory: $real"
+
+  local candidates=()
+  for p in "$real"/*/; do
+    p="${p%/}"; [ -d "$p" ] || continue
+    case "$(basename "$p")" in .*) continue;; esac
+    if [ -d "$p/.git" ]; then
+      candidates+=("$p")                       # direct-child repo
+    else
+      for sub in "$p"/*/; do                   # one level into a container dir (gems/, ...)
+        sub="${sub%/}"
+        if [ -d "$sub/.git" ]; then candidates+=("$sub"); fi
+      done
+    fi
+  done
+  [ ${#candidates[@]} -gt 0 ] || die "no git repos found under $real"
+
+  # member Gemfiles — for the "is this gem still depended on?" dormancy signal
+  local gemfiles=()
+  for repo in "${candidates[@]}"; do [ -f "$repo/Gemfile" ] && gemfiles+=("$repo/Gemfile"); done
+
+  info "== $name — candidate members under $real =="
+  local chosen=()
+  secs="$(date +%s)"
+  for repo in "${candidates[@]}"; do
+    base="$(basename "$repo")"
+    if [ "$(dirname "$repo")" = "$real" ]; then nested=no; else nested=yes; fi
+    ts="$(git -C "$repo" log -1 --format=%ct 2>/dev/null || true)"
+    if [ -n "$ts" ]; then age=$(( (secs - ts) / 86400 )); else age=999999; fi
+    if [ "$age" -ge "$STALE_DAYS" ]; then stale=yes; else stale=no; fi
+    referenced=no
+    if [ "$nested" = yes ] && [ ${#gemfiles[@]} -gt 0 ] && grep -qwF "$base" "${gemfiles[@]}" 2>/dev/null; then referenced=yes; fi
+    if [ "$stale" = yes ] || { [ "$nested" = yes ] && [ "$referenced" = no ]; }; then dormant=yes; else dormant=no; fi
+    if [ "$nested" = yes ] || [ "$dormant" = yes ]; then mark='*'; else mark=' '; chosen+=("$repo"); fi
+    last_rel="$(git -C "$repo" log -1 --format=%cr 2>/dev/null || true)"; [ -n "$last_rel" ] || last_rel='(no commits)'
+    printf '  %s %-28s nested=%-3s dormant=%-3s last=%s\n' "$mark" "$base" "$nested" "$dormant" "$last_rel"
+  done
+
+  info ""
+  info "* = nested or dormant — confirm before including (suggestion, not auto-inclusion)."
+  if [ ${#chosen[@]} -gt 0 ]; then
+    info "confirm the set, then scaffold (clean candidates shown; add any flagged ones by hand):"
+    info "  habituate create $name ${chosen[*]}"
+  else
+    info "every candidate is flagged — pick the ones you want, then scaffold:"
+    info "  habituate create $name <member>...   # choose from the list above"
+  fi
+  info "prints only — nothing was scaffolded; members stay hand-confirmed."
+}
+
+cmd_create() {
+  [ $# -ge 2 ] || die "create needs <name> and at least one <member> (or: <name> --from <parent>)"
+  local name="$1"; shift
+  case "$name" in */* | "") die "invalid habitat name: '$name'";; esac
+
+  if [ "${1:-}" = --from ]; then         # discovery mode: suggest members under a parent dir, then exit (prints only)
+    [ $# -ge 2 ] || die "create --from needs a <parent> dir"
+    suggest_members "$name" "$2"
+    return 0
+  fi
+
+  local hab="$HABITATS/$name"
+  [ -e "$hab" ] && die "habitat already exists: $hab"
+
+  local members=() m real
+  for m in "$@"; do
+    real="$(resolve_member "$m")" || die "member not found: $m"
+    [ -d "$real" ] || die "member is not a directory: $real"
+    members+=("$real")
+  done
+
+  ensure_parent_symlink
+  mkdir -p "$hab"
+  for real in "${members[@]}"; do
+    ln -s "$real" "$hab/$(basename "$real")"   # absolute symlink
+    info "  linked $(basename "$real") -> $real"
+  done
+
+  write_skeleton "$hab" "$name" "${members[@]}"
+
+  ( cd "$hab" \
+      && git init -q . \
+      && git add -A \
+      && git commit -q \
+           -m "feat: establish $name habitat (members + skeleton rules)" \
+           -m "Symlinks the member repos and adds a CLAUDE.md skeleton to be authored." )
+
+  info "created habitat '$name' at $hab (skeleton committed)"
+  info "next: (1) author the map + rules + routing in CLAUDE.md, then (2) commit again in the habitat repo"
+  info "      ('habituate doctor $name' warns if it's left with TODOs or uncommitted)"
+}
+
+cmd_doctor() {
+  local names=() name hab rc=0
+
+  # the shared parent symlink that makes HABITAT.md load for every habitat
+  if [ -L "$HABITATS/CLAUDE.md" ] && [ -f "$HABITATS/CLAUDE.md" ]; then
+    info "parent: habitats/CLAUDE.md -> $(cd "$HABITATS" && readlink CLAUDE.md) (ok)"
+  else
+    info "parent: FAIL — habitats/CLAUDE.md should symlink ../HABITAT.md (fix: ln -s ../HABITAT.md '$HABITATS/CLAUDE.md')"; rc=1
+  fi
+
+  if [ $# -ge 1 ]; then names=("$1"); else
+    for hab in "$HABITATS"/*/; do [ -d "$hab" ] && names+=("$(basename "$hab")"); done
+  fi
+  [ ${#names[@]} -gt 0 ] || { info "no habitats found under $HABITATS"; return "$rc"; }
+
+  local link member target
+  for name in "${names[@]}"; do
+    hab="$HABITATS/$name"
+    info "== $name =="
+    [ -d "$hab" ] || { info "  FAIL: no such habitat"; rc=1; continue; }
+    if [ -d "$hab/.git" ]; then info "  ok: git repo"; else info "  FAIL: not a git repo"; rc=1; fi
+    if [ -f "$hab/CLAUDE.md" ]; then
+      info "  ok: CLAUDE.md present"
+      if grep -q 'TODO' "$hab/CLAUDE.md" 2>/dev/null; then info "  WARN: CLAUDE.md still has TODO placeholders — author it"; fi
+      if [ -n "$(git -C "$hab" status --porcelain CLAUDE.md 2>/dev/null)" ]; then info "  WARN: CLAUDE.md has uncommitted changes — commit after authoring"; fi
+    else info "  FAIL: no CLAUDE.md"; rc=1; fi
+    for link in "$hab"/*/; do
+      [ -L "${link%/}" ] || continue
+      member="$(basename "$link")"
+      if target="$(cd "$hab/$member" 2>/dev/null && pwd -P)"; then
+        info "  ok: $member -> $target"
+      else
+        info "  FAIL: $member -> broken symlink"; rc=1
+      fi
+    done
+  done
+  return "$rc"
+}
+
+cmd_activity() {
+  local names=() name hab link member m dirty lock bd last mark any=0
+  if [ $# -ge 1 ]; then names=("$1"); else
+    for hab in "$HABITATS"/*/; do [ -d "$hab" ] && names+=("$(basename "$hab")"); done
+  fi
+  [ ${#names[@]} -gt 0 ] || { info "no habitats found under $HABITATS"; return 0; }
+
+  for name in "${names[@]}"; do
+    hab="$HABITATS/$name"
+    [ -d "$hab" ] || { info "== $name == (no such habitat)"; continue; }
+    info "== $name — member activity =="
+    for link in "$hab"/*/; do
+      [ -L "${link%/}" ] || continue
+      member="$(basename "$link")"; m="$hab/$member"
+      if [ ! -d "$m/.git" ]; then printf '    %-26s (not a git repo)\n' "$member"; continue; fi
+      dirty=$(git -C "$m" status --porcelain 2>/dev/null | grep -vE "$ACTIVITY_IGNORE" | grep -c . || true)
+      if [ -e "$m/.git/index.lock" ]; then lock=yes; else lock=no; fi
+      bd=$(git -C "$m" status --porcelain 2>/dev/null | grep -vE "$ACTIVITY_IGNORE" | grep -cE '\.(beads|seeds)/' || true)
+      last=$(git -C "$m" log -1 --format='%cr' 2>/dev/null || true); [ -n "$last" ] || last='(no commits)'
+      if [ "$dirty" -gt 0 ] || [ "$lock" = yes ] || [ "$bd" -gt 0 ]; then mark='*'; any=1; else mark=' '; fi
+      printf '  %s %-26s dirty=%-3s lock=%-3s tasks/seeds=%-3s last=%s\n' "$mark" "$member" "$dirty" "$lock" "$bd" "$last"
+    done
+  done
+  [ "$any" -eq 0 ] || { info ""; info "* in-flight work — another agent or parallel work may be active; coordinate before sweeping changes."; }
+}
+
+cmd_ready() {
+  local names=() name hab link member m out
+  if [ $# -ge 1 ]; then names=("$1"); else
+    for hab in "$HABITATS"/*/; do [ -d "$hab" ] && names+=("$(basename "$hab")"); done
+  fi
+  [ ${#names[@]} -gt 0 ] || { info "no habitats found under $HABITATS"; return 0; }
+  for name in "${names[@]}"; do
+    hab="$HABITATS/$name"
+    [ -d "$hab" ] || { info "== $name == (no such habitat)"; continue; }
+    info "== $name — ready work across members =="
+    for link in "$hab"/*/; do
+      [ -L "${link%/}" ] || continue
+      member="$(basename "$link")"; m="$hab/$member"
+      info "-- $member"
+      if [ -d "$m/.beads" ]; then
+        out="$(cd "$m" && bd ready 2>/dev/null || true)"
+        if [ -n "$out" ]; then info "   [bd ready]"; printf '%s\n' "$out" | sed 's/^/     /'; else info "   [bd ready] none"; fi
+      fi
+      if [ -d "$m/.seeds" ]; then
+        out="$(cd "$m" && seeds ready 2>/dev/null || true)"
+        if [ -n "$out" ]; then info "   [seeds ready]"; printf '%s\n' "$out" | sed 's/^/     /'; else info "   [seeds ready] none"; fi
+      fi
+    done
+  done
+}
+
+cmd_members() {
+  local names=() name hab link member m pfx bp sp
+  if [ $# -ge 1 ]; then names=("$1"); else
+    for hab in "$HABITATS"/*/; do [ -d "$hab" ] && names+=("$(basename "$hab")"); done
+  fi
+  [ ${#names[@]} -gt 0 ] || { info "no habitats found under $HABITATS"; return 0; }
+  for name in "${names[@]}"; do
+    hab="$HABITATS/$name"
+    [ -d "$hab" ] || { info "== $name == (no such habitat)"; continue; }
+    info "== $name — members (deterministic; author roles into the CLAUDE.md map) =="
+    for link in "$hab"/*/; do
+      [ -L "${link%/}" ] || continue
+      member="$(basename "$link")"; m="$hab/$member"
+      pfx="$(member_prefixes "$m")"; bp="${pfx%%|*}"; sp="${pfx##*|}"
+      printf '  %-28s beads:%-26s seeds:%s\n' "$member" "$bp" "$sp"
+    done
+  done
+}
+
+cmd_list() { local d; for d in "$HABITATS"/*/; do [ -d "$d" ] && basename "$d"; done; }
+
+cmd_path() {
+  [ $# -ge 1 ] || die "path needs <name>"
+  local h="$HABITATS/$1"; [ -d "$h" ] || die "no such habitat: $1"
+  printf '%s\n' "$h"
+}
+
+cmd_hop() {
+  [ $# -ge 1 ] || die "hop needs <name>"
+  local h="$HABITATS/$1"; [ -d "$h" ] || die "no such habitat: $1"
+  printf '%s\n' "$h"
+  printf 'habituate: install the shell wrapper (home-manager) for cd + tmux — a subprocess cannot change your shell.\n' >&2
+}
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    create) cmd_create "$@";;
+    doctor) cmd_doctor "$@";;
+    activity) cmd_activity "$@";;
+    ready)  cmd_ready "$@";;
+    members) cmd_members "$@";;
+    list)   cmd_list "$@";;
+    path)   cmd_path "$@";;
+    hop)    cmd_hop "$@";;
+    help | -h | --help) usage;;
+    *) usage; die "unknown subcommand: '$sub'";;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,10 @@
+/habitats/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# Beads audit log — local-only; issue source of truth is Dolt (bd history). Opting out of the audit/SFT trail.
+.beads/interactions.jsonl

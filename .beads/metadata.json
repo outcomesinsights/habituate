@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "habituate",
+  "project_id": "7f3c7792-0c1a-46c3-9a68-14f25b0275ab"
+}
