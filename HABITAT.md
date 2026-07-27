@@ -13,6 +13,14 @@ own `CLAUDE.md` (loaded alongside this file) carries the domain map, rules, and 
   for tasks); they print the AI-oriented cheat sheet. Plan mode is ephemeral — **seeds are the durable
   record**, so capture plans as seeds. Tasks → that member's `bd`.
 - **No habitat-level seeds or beads** (yet) — a habitat has none of its own; everything lands in members.
+- **A `seeds` command/skill invoked from the habitat fans out across *every* member's `.seeds`.**
+  Because the habitat has no seeds DB of its own, running something like `/transcript-seeds` (or any
+  `seeds` operation) here means **all member-repos' seeds databases should be consulted and modified as
+  appropriate** — route each candidate to the member that owns it (per this habitat's `CLAUDE.md` routing),
+  and one invocation can legitimately touch several members. Don't treat the cwd basename as a single
+  target slug — there may be no member (or extraction) by that name. Honor pre-flight **per member**
+  (clean tree, `habituate activity`, coordinate before clobbering): they're independent git repos, so a
+  dirty or actively-worked member is skipped/flagged on its own without blocking the clean ones.
 - **Members are habitat-agnostic.** A member may belong to several habitats and is not wired
   to know about any of them; don't add habitat knowledge or cross-repo references into a member. Working
   *directly* in a member repo is rare and deliberate — with no habitat context by default. If you think you
