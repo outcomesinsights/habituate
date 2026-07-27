@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# scrub-check — fail if tracked, publicly-shipped content carries anything that must not
+# reach the public repo. Two layers:
+#   1. generic secret / email patterns (safe to name here — they are not the secrets)
+#   2. a LOCAL, gitignored denylist of specific names / products / codenames
+#      (.scrub-denylist — that file names the very things we're hiding, so it is never
+#       committed; a checkout without it runs layer 1 only, with a warning)
+# Scans tracked *.md + .seeds/seeds.jsonl in the working tree. Run with a clean tree
+# before pushing; wired into `just ci`. NOTE: a denylist is a backstop, not a guarantee —
+# a clean run means "no KNOWN-bad terms", not "safe". Novel names still need a human eye.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+paths=('*.md' '.seeds/seeds.jsonl')
+fail=0
+
+# 1) generic secret / email patterns
+generic='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]+|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+if git grep -nEI "$generic" -- "${paths[@]}" 2>/dev/null | grep -v 'noreply@anthropic.com'; then
+  echo ">>> scrub-check: matched a generic secret/email pattern (above)"
+  fail=1
+fi
+
+# 2) local, gitignored denylist of specific terms
+denylist='.scrub-denylist'
+if [[ -f "$denylist" ]]; then
+  pat="$(grep -vE '^[[:space:]]*(#|$)' "$denylist" | paste -sd'|' -)"
+  if [[ -n "$pat" ]] && git grep -nEI "$pat" -- "${paths[@]}" 2>/dev/null; then
+    echo ">>> scrub-check: matched a denylisted term (above)"
+    fail=1
+  fi
+else
+  echo "scrub-check: WARNING — $denylist not found; ran generic patterns only"
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+  echo "scrub-check: FAILED — scrub the flagged content before pushing."
+  exit 1
+fi
+echo "scrub-check: clean"
