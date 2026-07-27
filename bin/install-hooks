@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# install-hooks — install a pre-push git hook that runs `just ci` (lint + smoke +
+# scrub-check), coexisting with beads' hooks. Idempotent; run once per clone.
+#
+# Beads sets core.hooksPath=.beads/hooks, which hides any .git/hooks/pre-push. So we
+# unset it, symlink the beads hooks back into .git/hooks (so beads keeps working AND its
+# updates still propagate through the symlinks), and add a pre-push that chains the beads
+# pre-push then `just ci`. A failing gate blocks the push.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+git config --unset-all core.hooksPath 2>/dev/null || true
+
+for h in post-checkout post-merge pre-commit prepare-commit-msg; do
+  if [ -e ".beads/hooks/$h" ]; then
+    ln -sf "../../.beads/hooks/$h" ".git/hooks/$h"
+  fi
+done
+
+cat > .git/hooks/pre-push <<'HOOK'
+#!/usr/bin/env sh
+# habituate: run beads' pre-push, then the `just ci` gate (blocks a push that fails).
+root="$(git rev-parse --show-toplevel)"
+if [ -x "$root/.beads/hooks/pre-push" ]; then
+  "$root/.beads/hooks/pre-push" "$@" || exit $?
+fi
+cd "$root" && exec just ci
+HOOK
+chmod +x .git/hooks/pre-push
+
+echo "install-hooks: pre-push -> 'just ci'; beads hooks symlinked into .git/hooks"

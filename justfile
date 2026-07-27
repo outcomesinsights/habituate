@@ -9,9 +9,10 @@ default:
 
 # Static-analyse the shell: shellcheck + a bash syntax parse
 lint:
-    shellcheck bin/habituate bin/scrub-check
+    shellcheck bin/habituate bin/scrub-check bin/install-hooks
     bash -n bin/habituate
     bash -n bin/scrub-check
+    bash -n bin/install-hooks
 
 # Smoke-test: the CLI loads and dispatches without error
 test:
@@ -27,3 +28,7 @@ scrub-check:
 
 # Full local CI equivalent — run this before pushing
 ci: lint test scrub-check
+
+# Install git hooks (pre-push -> `just ci`), coexisting with beads. Run once per clone.
+install-hooks:
+    ./bin/install-hooks
